@@ -1,3 +1,3 @@
 User-agent: *
 Allow: /
-Sitemap: https://topproductguides.pages.dev/sitemap.xml
+Sitemap: https://bestseoagencyforrealestateagents.com/sitemap.xml
