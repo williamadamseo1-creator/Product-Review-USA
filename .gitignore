@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# Large/raw source data (not needed for static deploy repo)
+productdata.csv
+
+# Local experimental outputs
+generated_html_pages_chunk_test/
+generated_html_pages_copycheck/
+
