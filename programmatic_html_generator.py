@@ -10,7 +10,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.request import Request, urlopen
 
 YEAR = datetime.now().year
 FEATURE_IMAGE_WIDTH = 1200
@@ -44,6 +46,11 @@ class SiteConfig:
     guides_page_size: int
     related_links_count: int
     sitemap_chunk_size: int
+    indexnow_key: str
+    indexnow_key_location: str
+    indexnow_endpoint: str
+    indexnow_submit: bool
+    indexnow_batch_size: int
 
 
 @dataclass
@@ -171,6 +178,17 @@ def parse_int_like(value: object, default: int) -> int:
         return int(float(str(value).strip()))
     except Exception:
         return default
+
+
+def parse_bool_like(value: object, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
 
 
 def clean_text_artifacts(text: str) -> str:
@@ -1742,6 +1760,122 @@ def absolute_url(config: SiteConfig, path: str) -> str:
     return f"{config.site_url}/{public_path}"
 
 
+def site_host(config: SiteConfig) -> str:
+    parsed = urlparse(config.site_url)
+    return (parsed.netloc or parsed.path).strip().lower()
+
+
+def resolve_indexnow_key_location(config: SiteConfig) -> str:
+    custom = (config.indexnow_key_location or "").strip()
+    if not custom:
+        return absolute_url(config, f"{config.indexnow_key}.txt")
+    if re.match(r"^https?://", custom, flags=re.IGNORECASE):
+        return custom
+    return absolute_url(config, custom)
+
+
+def write_indexnow_key_file(output_dir: Path, key: str) -> Path | None:
+    clean_key = (key or "").strip()
+    if not clean_key:
+        return None
+    out = output_dir / f"{clean_key}.txt"
+    out.write_text(clean_key, encoding="utf-8")
+    return out
+
+
+def write_indexnow_url_manifest(output_dir: Path, urls: Sequence[str]) -> Path:
+    out = output_dir / "indexnow-urls.txt"
+    out.write_text("\n".join(urls) + ("\n" if urls else ""), encoding="utf-8")
+    return out
+
+
+def read_indexnow_url_manifest(output_dir: Path) -> List[str]:
+    path = output_dir / "indexnow-urls.txt"
+    if not path.exists():
+        return []
+    lines = [line.strip() for line in path.read_text(encoding="utf-8").splitlines()]
+    return [line for line in lines if line]
+
+
+def submit_indexnow(config: SiteConfig, urls: Sequence[str]) -> Dict[str, object]:
+    result: Dict[str, object] = {
+        "enabled": bool(config.indexnow_key),
+        "submitted": False,
+        "endpoint": config.indexnow_endpoint,
+        "host": site_host(config),
+        "key_location": "",
+        "batch_count": 0,
+        "submitted_url_count": 0,
+        "failed_batches": 0,
+        "last_status_code": 0,
+        "error": "",
+    }
+    key = (config.indexnow_key or "").strip()
+    if not key:
+        result["error"] = "indexnow_key_missing"
+        return result
+    url_list = sorted(set(u.strip() for u in urls if u.strip()))
+    if not url_list:
+        result["error"] = "url_list_empty"
+        return result
+
+    key_location = resolve_indexnow_key_location(config)
+    result["key_location"] = key_location
+    endpoint = (config.indexnow_endpoint or "").strip() or "https://api.indexnow.org/indexnow"
+    batch_size = max(1, int(config.indexnow_batch_size or 10000))
+    batches = [url_list[i : i + batch_size] for i in range(0, len(url_list), batch_size)]
+    result["batch_count"] = len(batches)
+
+    for batch in batches:
+        payload = {
+            "host": site_host(config),
+            "key": key,
+            "keyLocation": key_location,
+            "urlList": batch,
+        }
+        data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        req = Request(
+            endpoint,
+            data=data,
+            headers={
+                "Content-Type": "application/json; charset=utf-8",
+                "User-Agent": "programmatic-indexnow-client/1.0",
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(req, timeout=30) as resp:
+                status_code = int(resp.getcode() or 0)
+        except HTTPError as e:
+            status_code = int(e.code or 0)
+            result["failed_batches"] = int(result["failed_batches"]) + 1
+            if not result["error"]:
+                result["error"] = f"http_{status_code}"
+            result["last_status_code"] = status_code
+            continue
+        except URLError as e:
+            result["failed_batches"] = int(result["failed_batches"]) + 1
+            if not result["error"]:
+                result["error"] = f"url_error:{e.reason}"
+            continue
+        except Exception as e:  # noqa: BLE001
+            result["failed_batches"] = int(result["failed_batches"]) + 1
+            if not result["error"]:
+                result["error"] = f"exception:{type(e).__name__}"
+            continue
+
+        result["last_status_code"] = status_code
+        if status_code in (200, 202):
+            result["submitted_url_count"] = int(result["submitted_url_count"]) + len(batch)
+        else:
+            result["failed_batches"] = int(result["failed_batches"]) + 1
+            if not result["error"]:
+                result["error"] = f"http_{status_code}"
+
+    result["submitted"] = int(result["submitted_url_count"]) > 0 and int(result["failed_batches"]) == 0
+    return result
+
+
 def nav_items() -> List[Tuple[str, str]]:
     return [
         ("Home", "index.html"),
@@ -2618,6 +2752,11 @@ def write_config_template(path: Path) -> None:
         "guides_page_size": 500,
         "related_links_count": 6,
         "sitemap_chunk_size": 40000,
+        "indexnow_key": "",
+        "indexnow_key_location": "",
+        "indexnow_endpoint": "https://api.indexnow.org/indexnow",
+        "indexnow_submit": False,
+        "indexnow_batch_size": 10000,
         "page_copy": dict(DEFAULT_PAGE_COPY),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -2659,6 +2798,11 @@ def merge_settings(args: argparse.Namespace) -> Dict[str, object]:
         "guides_page_size",
         "related_links_count",
         "sitemap_chunk_size",
+        "indexnow_key",
+        "indexnow_key_location",
+        "indexnow_endpoint",
+        "indexnow_submit",
+        "indexnow_batch_size",
     ]
     for key in override_keys:
         value = getattr(args, key, None)
@@ -2679,7 +2823,7 @@ def generate(
     seed: str | None,
     config: SiteConfig,
     page_copy: Dict[str, str],
-) -> Tuple[List[Path], List[Path]]:
+) -> Tuple[List[Path], List[Path], Dict[str, object]]:
     grouped = load_products(csv_path)
     if not grouped:
         raise ValueError("No valid rows found in CSV.")
@@ -2700,7 +2844,7 @@ def generate(
         builds.append(ArticleBuild(keyword=keyword, slug=unique_slug(keyword, used_slugs), products=picks))
 
     if not builds:
-        return [], []
+        return [], [], {}
 
     for build in builds:
         seed_rng = random.Random(f"{run_seed}|feature|{build.slug}")
@@ -2736,7 +2880,19 @@ def generate(
     write_sitemap(output_dir, config, all_pages)
     write_robots(output_dir, config)
     write_cloudflare_files(output_dir)
-    return article_pages, static_pages
+    all_public_urls = [absolute_url(config, name) for name in sorted(set(all_pages))]
+    key_file_path = write_indexnow_key_file(output_dir, config.indexnow_key)
+    manifest_path = write_indexnow_url_manifest(output_dir, all_public_urls)
+    indexnow_result: Dict[str, object] = {
+        "enabled": bool((config.indexnow_key or "").strip()),
+        "submitted": False,
+        "key_file": str(key_file_path) if key_file_path else "",
+        "manifest_file": str(manifest_path),
+        "url_count": len(all_public_urls),
+    }
+    if config.indexnow_submit and config.indexnow_key:
+        indexnow_result.update(submit_indexnow(config, all_public_urls))
+    return article_pages, static_pages, indexnow_result
 
 
 def parse_args() -> argparse.Namespace:
@@ -2760,6 +2916,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--guides-page-size", type=int, default=None, help="How many guides per all-guides page")
     p.add_argument("--related-links-count", type=int, default=None, help="Related links per article")
     p.add_argument("--sitemap-chunk-size", type=int, default=None, help="URLs per sitemap file before splitting")
+    p.add_argument("--indexnow-key", default=None, help="IndexNow API key")
+    p.add_argument("--indexnow-key-location", default=None, help="Optional public URL/path to IndexNow key file")
+    p.add_argument("--indexnow-endpoint", default=None, help="IndexNow endpoint URL")
+    p.add_argument("--indexnow-submit", default=None, help="Submit URLs to IndexNow after generation (true/false)")
+    p.add_argument("--indexnow-batch-size", type=int, default=None, help="URLs per IndexNow POST batch")
+    p.add_argument("--indexnow-submit-existing", action="store_true", help="Submit URLs from existing indexnow-urls.txt without regenerating pages")
     return p.parse_args()
 
 
@@ -2786,8 +2948,6 @@ def main() -> None:
     output_value = first_non_empty(settings.get("output"), fallback="generated_html_pages")
     input_path = Path(input_value) if Path(input_value).is_absolute() else (base / input_value)
     output_path = Path(output_value) if Path(output_value).is_absolute() else (base / output_value)
-    if not input_path.exists():
-        raise FileNotFoundError(f"Input CSV not found: {input_path}")
 
     config = SiteConfig(
         site_name=first_non_empty(settings.get("site_name"), fallback="Buyer Verdict Hub"),
@@ -2803,7 +2963,45 @@ def main() -> None:
         guides_page_size=max(50, parse_int_like(settings.get("guides_page_size"), 500)),
         related_links_count=max(2, parse_int_like(settings.get("related_links_count"), 6)),
         sitemap_chunk_size=max(1, parse_int_like(settings.get("sitemap_chunk_size"), 40000)),
+        indexnow_key=first_non_empty(settings.get("indexnow_key"), fallback=""),
+        indexnow_key_location=first_non_empty(settings.get("indexnow_key_location"), fallback=""),
+        indexnow_endpoint=first_non_empty(settings.get("indexnow_endpoint"), fallback="https://api.indexnow.org/indexnow"),
+        indexnow_submit=parse_bool_like(settings.get("indexnow_submit"), default=False),
+        indexnow_batch_size=max(1, parse_int_like(settings.get("indexnow_batch_size"), 10000)),
     )
+
+    if args.indexnow_submit_existing:
+        urls = read_indexnow_url_manifest(output_path)
+        if not urls:
+            raise FileNotFoundError(
+                f"IndexNow URL manifest not found or empty: {output_path / 'indexnow-urls.txt'}"
+            )
+        key_path = write_indexnow_key_file(output_path, config.indexnow_key)
+        result = submit_indexnow(config, urls)
+        report = {
+            "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "output_dir": str(output_path),
+            "site_url": config.site_url,
+            "config_file": str(args.config_file or ""),
+            "indexnow": {
+                **result,
+                "url_count": len(urls),
+                "key_file": str(key_path) if key_path else "",
+                "manifest_file": str(output_path / "indexnow-urls.txt"),
+            },
+        }
+        (output_path / "generation_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+        if result.get("submitted"):
+            print(f"IndexNow submitted: {result.get('submitted_url_count', 0)} URLs")
+        else:
+            print(
+                "IndexNow submit failed or partial. "
+                f"error={result.get('error', '')} status={result.get('last_status_code', 0)}"
+            )
+        return
+
+    if not input_path.exists():
+        raise FileNotFoundError(f"Input CSV not found: {input_path}")
 
     page_copy = load_page_copy(settings, base)
 
@@ -2813,7 +3011,7 @@ def main() -> None:
     else:
         keywords_value = first_non_empty(keywords_raw, fallback="")
         keywords = [clean_text_artifacts(x) for x in keywords_value.split(",") if x.strip()]
-    article_pages, static_pages = generate(
+    article_pages, static_pages, indexnow_result = generate(
         csv_path=input_path,
         output_dir=output_path,
         top_n=max(3, parse_int_like(settings.get("top_n"), 10)),
@@ -2838,8 +3036,19 @@ def main() -> None:
         "static_files": [p.name for p in static_pages],
         "site_url": config.site_url,
         "config_file": str(args.config_file or ""),
+        "indexnow": indexnow_result,
     }
     (output_path / "generation_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    if indexnow_result.get("enabled"):
+        if indexnow_result.get("submitted"):
+            print(f"IndexNow submitted: {indexnow_result.get('submitted_url_count', 0)} URLs")
+        elif config.indexnow_submit:
+            print(
+                "IndexNow submit failed or partial. "
+                f"error={indexnow_result.get('error', '')} status={indexnow_result.get('last_status_code', 0)}"
+            )
+        else:
+            print("IndexNow ready: key file + URL manifest generated (submit disabled in config).")
     print(f"Done. Generated {len(article_pages)} article pages + {len(static_pages)} site pages in {output_path}")
 if __name__ == "__main__":
     main()
