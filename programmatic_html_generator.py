@@ -1715,10 +1715,31 @@ def normalize_site_url(url: str) -> str:
     return clean.rstrip("/")
 
 
+def normalize_public_path(path: str) -> str:
+    raw = (path or "").strip().lstrip("/")
+    if not raw:
+        return ""
+    path_part, sep_hash, fragment = raw.partition("#")
+    path_part, sep_q, query = path_part.partition("?")
+    clean_part = path_part.strip()
+    if clean_part in {"", "index", "index.html"}:
+        clean_part = ""
+    elif clean_part.lower().endswith(".html"):
+        clean_part = clean_part[:-5]
+
+    rebuilt = clean_part
+    if sep_q:
+        rebuilt = f"{rebuilt}?{query}" if rebuilt else f"?{query}"
+    if sep_hash:
+        rebuilt = f"{rebuilt}#{fragment}" if rebuilt else f"#{fragment}"
+    return rebuilt
+
+
 def absolute_url(config: SiteConfig, path: str) -> str:
-    if not path or path == "index.html":
+    public_path = normalize_public_path(path)
+    if not public_path:
         return f"{config.site_url}/"
-    return f"{config.site_url}/{path.lstrip('/')}"
+    return f"{config.site_url}/{public_path}"
 
 
 def nav_items() -> List[Tuple[str, str]]:
@@ -2561,6 +2582,7 @@ def write_cloudflare_files(output_dir: Path) -> None:
     )
     redirects = (
         "/index.html / 301\n"
+        "/:slug.html /:slug 301\n"
         "/home / 301\n"
         "/all-guides/ /all-guides.html 301\n"
         "/privacy /privacy-policy.html 301\n"
